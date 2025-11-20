@@ -27,7 +27,6 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
-    "PrometheusConfig",
     "RolloutConfig",
 ]
 
@@ -77,11 +76,6 @@ class AgentLoopConfig(BaseConfig):
 class TraceConfig(BaseConfig):
     backend: Optional[str] = None
     token2text: bool = False
-    max_samples_per_step_per_worker: Optional[int] = None
-
-    def __post_init__(self):
-        if self.max_samples_per_step_per_worker is not None and self.max_samples_per_step_per_worker < 0:
-            raise ValueError("`max_samples_per_step_per_worker` must be a non-negative integer or null.")
 
 
 @dataclass
@@ -95,22 +89,6 @@ class ServerConfig(BaseConfig):
     retry_delay: float = 2.0
     max_connections: int = 1000
     max_start_wait_time: float = 300.0
-
-
-@dataclass
-class PrometheusConfig(BaseConfig):
-    """
-    Configuration for Prometheus server
-    """
-
-    # whether enable prometheus on server mode rollout
-    enable: bool = False
-    # Port number that Prometheus listens on, default is 9090
-    port: int = 9090
-    # Path to Prometheus configuration file
-    file: str = "/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"
-    # Specify served_model_name to avoid displaying overly long model paths in Grafana
-    served_model_name: Optional[str] = None
 
 
 @dataclass
@@ -175,9 +153,6 @@ class RolloutConfig(BaseConfig):
 
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
-
-    # Use Prometheus to collect and monitor rollout statistics
-    prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
 
     update_weights_bucket_megabytes: int = 512
 

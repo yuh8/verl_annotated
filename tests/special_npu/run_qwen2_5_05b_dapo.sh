@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
-export VLLM_ASCEND_ENABLE_NZ=0
 
 NUM_GPUS=${NUM_GPUS:-16}
 

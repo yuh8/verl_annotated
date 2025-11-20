@@ -85,7 +85,7 @@ unit_texts = [
     "mph",
     "kmph",
     "ft",
-    "m square",
+    "m sqaure",
     " m east",
     "sq m",
     "deg",

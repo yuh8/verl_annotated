@@ -25,7 +25,6 @@ license_head_modelbest = "Copyright 2025 ModelBest Inc. and/or its affiliates"
 license_head_amazon = "Copyright 2025 Amazon.com Inc and/or its affiliates"
 license_head_facebook = "Copyright (c) 2016-     Facebook, Inc"
 license_head_meituan = "Copyright 2025 Meituan Ltd. and/or its affiliates"
-license_head_huawei = "Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved."
 license_headers = [
     license_head_bytedance,
     license_head_bytedance_25,
@@ -36,7 +35,6 @@ license_headers = [
     license_head_amazon,
     license_head_facebook,
     license_head_meituan,
-    license_head_huawei,
 ]
 
 

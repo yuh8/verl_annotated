@@ -16,10 +16,10 @@ import asyncio
 import json
 import logging
 import os
+import pickle
 from pprint import pprint
 from typing import Any, Callable, Optional
 
-import cloudpickle as pickle
 import numpy as np
 import ray
 import vllm.entrypoints.cli.serve
@@ -220,7 +220,7 @@ class vLLMHttpServerBase:
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
-            "trust_remote_code": self.model_config.trust_remote_code,
+            # "trust_remote_code": True,
             "max_model_len": self.config.max_model_len,
             "max_num_seqs": self.config.max_num_seqs,
             "enable_chunked_prefill": self.config.enable_chunked_prefill,
@@ -236,16 +236,6 @@ class vLLMHttpServerBase:
             "override_generation_config": json.dumps(override_generation_config),
             **engine_kwargs,
         }
-
-        if self.config.prometheus.enable:
-            if self.config.prometheus.served_model_name:
-                # Extract model name from path if it's a full path
-                served_model_name = self.config.prometheus.served_model_name
-                if "/" in served_model_name:
-                    # If it's a full path, extract the last part as model name
-                    served_model_name = served_model_name.split("/")[-1]
-                args["served_model_name"] = served_model_name
-
         if self.config.expert_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"

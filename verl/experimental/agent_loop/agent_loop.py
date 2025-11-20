@@ -11,6 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+# CLUSTER LEVEL
+# ╰─ AgentLoopManager (local, single)
+#       ╰─ launches(instantiates) N remote and stateful workers across the cluster
+
+# DISTRIBUTED WORKERS (Ray Actors)
+# ╰─ AgentLoopWorker   <--- MUST be remote and stateful for maintaining its own eventloop for task scheduling
+#        ╰─ initiates and runs an event loop per worker
+#        ╰─ spawns N concurrent agent loop tasks
+#        ╰─ owns AND instantiates routing helper-AsyncLLMServerManager
+#        ╰─ owns AND instantiates a remote stateful reward ray actor
+#        ╰─ interacts with vLLM servers
+
+# PER-SAMPLE EXECUTION (local inside worker)
+# ╰─ AgentLoopBase subclass   <--- MUST be local
+#        ╰─ one instance per sample
+#        ╰─ short-lived
+#        ╰─ uses AsyncLLMServerManager.generate()
+
+# ROUTING HELPER (local inside worker)
+# ╰─ AsyncLLMServerManager    <--- MUST be local
+#        ╰─ keeps heap, LRU, sticky routing
+#        ╰─ talks to vLLM servers
+
+# LLM SERVERS
+# ╰─ vLLM actors  <--- remote
+
+
 import asyncio
 import heapq
 import logging
@@ -18,7 +47,6 @@ import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Optional
-from uuid import uuid4
 
 import hydra
 import numpy as np
@@ -30,8 +58,6 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
-from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
-from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.reward import RewardManagerWorker
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
@@ -55,6 +81,17 @@ class AsyncLLMServerManager:
     A class to manage multiple OpenAI compatible LLM servers. This class provides
     - Load balance: least requests load balancing
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+
+    Flow:
+    Request received
+        ↓
+    Check LRU cache → reuse server if exists
+        ↓
+    Else pick least-loaded server (heap top)
+        ↓
+    Dispatch async generation task to that server
+        ↓
+    Return future / Ray ObjectRef to caller
     """
 
     def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
@@ -69,20 +106,26 @@ class AsyncLLMServerManager:
         self.server_handles = server_handles
         random.shuffle(self.server_handles)
 
-        # Least requests load balancing
+        # Build a min-heap (O(n)) for least-requests load balancing; allows O(1) access to least-loaded server and O(log n) updates.
         self.weighted_serveres = [[0, (hash(server), server)] for server in server_handles]
         heapq.heapify(self.weighted_serveres)
 
-        # LRU cache to map request_id to server
+        # Bounded O(1) LRU cache for request→server mapping; prevents unbounded dict growth and preserves request stickiness.
+        # Same multi-turn completion ids goes to the same server initiating the completion for reusing the KV cache
+        # When number of existing request ids exceed max cache size, drop the least used
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
         # TODO: implement server pressure awareness load balancing
+        # For now, fetch the corresponding existing server for the request_id
         if request_id in self.request_id_to_server:
             return self.request_id_to_server[request_id]
 
+        # server weight heapfied, so poping the first always gets the least used server
         server = self.weighted_serveres[0][1][1]
+        # least used server is used, so increment its usage
         self.weighted_serveres[0][0] += 1
+        # update the heapfied list and reorder weight, so the first server is always the least used.
         heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
         self.request_id_to_server[request_id] = server
         return server
@@ -108,7 +151,7 @@ class AsyncLLMServerManager:
         """
         server = self._choose_server(request_id)
         output = await server.generate.remote(
-            request_id=uuid4().hex,  # use new request_id for each turn
+            request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
@@ -171,7 +214,36 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Extra fields for dynamic addition."""
 
 
-# make hydra.utils.instantiate happy
+# make hydra.utils.instantiate happy — wraps full DictConfig as one argument
+# -----------------------------------------------------------------------------
+# Hydra normally unpacks YAML config fields into keyword args when instantiating:
+#   YAML:
+#     _target_: my_module.MyManager
+#     param1: 42
+#     param2: "hello"
+#   → calls: MyManager(param1=42, param2="hello")
+#
+# If MyManager expects a single DictConfig instead:
+#   class MyManager:
+#       def __init__(self, config: DictConfig): ...
+# Hydra will raise:
+#   TypeError: MyManager.__init__() got an unexpected keyword argument 'param1'
+#
+# _DummyConfig fixes this by wrapping the full DictConfig:
+#   YAML:
+#     _target_: my_module._DummyConfig
+#     config:
+#       _target_: my_module.MyManager
+#       param1: 42
+#       param2: "hello"
+#
+# Usage:
+#   cfg = OmegaConf.load("conf/config.yaml")
+#   dummy = hydra.utils.instantiate(cfg)          # -> _DummyConfig(config=<DictConfig>)
+#   manager = hydra.utils.instantiate(dummy.config)  # -> MyManager(config=<DictConfig>)
+#
+# Result:
+#   MyManager receives the entire DictConfig cleanly.
 class _DummyConfig:
     def __init__(self, config: DictConfig) -> None:
         self.config = config
@@ -191,7 +263,7 @@ class AgentLoopBase(ABC):
         processor: AutoProcessor,
         **kwargs,
     ):
-        """Initialize agent loop, each sample will have its own loop instance.
+        """Initialize agent loop, each sample will have its own loop instance for async multiturn tool interaction, etc.
 
         Args:
             trainer_config (_DummyConfig): trainer config.
@@ -204,6 +276,9 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+        # self.loop = asyncio.get_running_loop() stores the active event loop so the object
+        # can schedule or manage async tasks consistently within the same coroutine context.
+        # Super important
         self.loop = asyncio.get_running_loop()
 
     @classmethod
@@ -238,12 +313,49 @@ class AgentLoopBase(ABC):
 used by hydra.utils.instantiate to initialize agent loop instance.
 
 https://hydra.cc/docs/advanced/instantiate_objects/overview/
+
+This is outside of all classes. it is global
 """
 _agent_loop_registry: dict[str, dict] = {}
 
 
 def register(agent_name: str):
-    """Register agent loop class."""
+    """
+    Agent loop registry and decorator for Hydra-compatible instantiation.
+    This registry maps each `agent_name` (e.g. "async", "sync") to a minimal Hydra config:
+        {
+            "agent_name": {"_target_": "<module_path>.<class_name>"}
+        }
+
+    The `register(agent_name)` decorator should be applied to subclasses of `AgentLoopBase`.
+    When the decorated class is defined, its fully qualified import path is automatically
+    recorded in `_agent_loop_registry`. This allows Hydra's `hydra.utils.instantiate()`
+    to later create the appropriate agent loop instance dynamically.
+
+    Example
+    -------
+    >>> @register("async")
+    ... class AsyncAgentLoop(AgentLoopBase):
+    ...     pass
+    >>> _agent_loop_registry
+    {'async': {'_target_': 'my_project.agent_loops.AsyncAgentLoop'}}
+
+    >>> from hydra.utils import instantiate
+    >>> loop = instantiate(_agent_loop_registry["async"])
+    >>> isinstance(loop, AsyncAgentLoop)
+    True
+
+    Reference
+    ---------
+    https://hydra.cc/docs/advanced/instantiate_objects/overview/
+
+    A decorator is just a callable that takes another callable and returns a callable.
+    It wraps the function in another callable, meaning it can:
+    - Preprocess or alter the inputs before calling the original function,
+    - Skip the original call altogether,
+    - Replace the result or wrap it with extra data,
+    - Handle errors, logging, or caching around it.
+    """
 
     def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
         fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
@@ -278,14 +390,27 @@ class AgentLoopWorkerBase:
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
+        # download huggingface model to local and return the cache directory
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
+        # NOTE:
+        # At import time, the @register(agent_name) decorator populates `_agent_loop_registry`
+        # with minimal Hydra blueprints, e.g. {"async": {"_target_": "pkg.module.AsyncAgentLoop"}}.
+        # These entries only record the class path for Hydra's dynamic instantiation.
+        #
+        # At runtime, once the composed Hydra config (`agent_loop_config`) is available,
+        # we overwrite the placeholder entry with the full config node.
+        # This "promotion" replaces the static class reference with the user-specified
+        # Hydra configuration that includes both `_target_` and runtime parameters
+        # (e.g. rollout_batch_size, timeout, etc.).
+        #
+        # In short: @register seeds the registry with class mappings,
+        # and this line finalizes it with the active, parameterized config.
         if agent_loop_config_path:
-            resolved_path = resolve_config_path(agent_loop_config_path)
-            agent_loop_configs = OmegaConf.load(resolved_path)
+            agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
@@ -293,6 +418,39 @@ class AgentLoopWorkerBase:
                 self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
             self.tokenizer.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
 
+        # Launch a RewardManagerWorker Ray actor with node affinity.
+        #
+        # The RewardManagerWorker is a long-lived remote process responsible for reward computation
+        # and routing. We explicitly use Ray's NodeAffinitySchedulingStrategy to ensure the actor
+        # runs on the same physical node as the current process. This guarantees low-latency
+        # communication with any local model servers, ZeroMQ sockets, or shared GPU resources.
+        #
+        # Breakdown:
+        #   - `RewardManagerWorker.options(...)` customizes how the actor is launched.
+        #   - `NodeAffinitySchedulingStrategy(node_id=..., soft=False)` pins the actor to a specific
+        #     node (here, the one running this code). `soft=False` means it is a hard constraint:
+        #     Ray will fail to schedule if that node is unavailable.
+        #   - `.remote(self.config, self.reward_router_address)` actually instantiates the actor,
+        #     passing initialization arguments (config + reward router address).
+        #   - The return value is a `ray.actor.ActorHandle`: a local proxy to the remote process,
+        #     allowing non-blocking async calls such as:
+        #         self.reward_manager_worker.compute_reward.remote(batch)
+        #
+        # In short, this line creates a remotely instantiated RewardManagerWorker pinned to the
+        # current node — effectively a "remote class instance ready for asynchronous calls".
+
+        # Current node (controller)
+        # │
+        # ├── get node_id of this node
+        # │
+        # ├── tell Ray: "launch RewardManagerWorker on this same node"
+        # │
+        # └── get back ActorHandle to the remote process
+        #       ↓
+        #    RewardManagerWorker (remote actor)
+        #    ├── runs independently on same node
+        #    ├── has access to same GPU / local router
+        #    └── receives (config, reward_router_address)
         self.reward_manager_worker = RewardManagerWorker.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
@@ -306,9 +464,14 @@ class AgentLoopWorkerBase:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
-            trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+    # This decorator automatically handles conversions between `BatchMeta` and
+    # `DataProto` in function parameters, and decides whether to sync function
+    # output back to `BatchMeta` based on configuration(`put_data`). It supports
+    # both synchronous and asynchronous functions (async def), and can control
+    # whether to enable enhanced logic via the global `HAS_TQ` variable (when disabled,
+    # simply calls the original function as-is).
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -354,35 +517,35 @@ class AgentLoopWorkerBase:
         else:
             index = np.arange(len(batch))
 
-        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+        # Build per-sample trajectory metadata from a flat list of sample indices.
 
-        # For n rollouts per sample, we trace all n rollouts for selected samples
-        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
-            unique_sample_indices = np.unique(index)
-            if max_samples_per_worker < len(unique_sample_indices):
-                selected_samples = set(
-                    np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
-                )
-                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
-            else:
-                traced_indices = set(range(len(batch)))
-        else:
-            traced_indices = set(range(len(batch)))
+        # `index` is a list where consecutive elements may refer to the same trajectory
+        # (e.g., [0,0,0,1,1,2,2,2]). This function reconstructs how long each sample
+        # has remained within its current trajectory segment by computing `rollout_n`:
 
+        #     - If index[i] == index[i-1], we are continuing the same trajectory and
+        #       increment the within-trajectory counter (`rollout_n += 1`).
+        #     - Otherwise (first element or trajectory boundary), we reset `rollout_n` to 0.
+
+        # This provides a lightweight way to recover episode/trajectory continuity from
+        # a flattened dataset without explicitly storing full trajectories. The result is
+        # a list of dictionaries, each containing:
+        #     • step:        current global training step
+        #     • sample_index: trajectory/episode ID for this sample
+        #     • rollout_n:    how deep we are in this trajectory segment
+        #     • validate:     whether this batch is from a validation rollout
+
+        # Returns:
+        #     list[dict]: Per-sample trajectory information aligned with `index`.
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # event loop for creating non blocking tasks (rollouts of samples)
         tasks = []
         for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-                )
-            )
+            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
@@ -394,7 +557,6 @@ class AgentLoopWorkerBase:
         trajectory: dict[str, Any],
         *,
         agent_name: str,
-        trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -403,7 +565,6 @@ class AgentLoopWorkerBase:
             rollout_n=trajectory["rollout_n"],
             validate=trajectory["validate"],
             name="agent_loop",
-            trace=trace,
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
@@ -418,7 +579,6 @@ class AgentLoopWorkerBase:
                 processor=self.processor,
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -447,6 +607,8 @@ class AgentLoopWorkerBase:
                 return_tensors="pt",
                 return_attention_mask=True,
             )
+
+            # If input is a 1D sequence without batchsize
             if prompt_output["input_ids"].dim() == 1:
                 prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
                 prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
@@ -473,11 +635,14 @@ class AgentLoopWorkerBase:
             if response_mask_output["input_ids"].dim() == 1:
                 response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
+            # Set the log probs of response mask to 0
             response_logprobs = None
             if output.response_logprobs is not None:
                 pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
                 response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+            # Get the complete response_mask, attention_mask and token ids for the complete sequence
+            # left padded concated with right padded
             response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
             attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
             input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -493,8 +658,22 @@ class AgentLoopWorkerBase:
                 from verl.models.transformers.qwen2_vl import get_rope_index
 
                 images = getattr(output, "multi_modal_data", {}).get("image", None)
+                # Decode the current text tokens into human-readable text.
+                # This is needed because Qwen2-VL's processor takes raw text + images
+                # and constructs a unified multimodal sequence (text tokens + image tokens),
+                # including grid metadata required to compute RoPE indices for vision tokens.
                 current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+
+                # Run the Qwen2-VL processor to build multimodal inputs such as:
+                #   - pixel_values / image embeddings
+                #   - image_grid_thw (token grid: T/H/W)
+                #   - video_grid_thw (for videos)
+                #   - second_per_grid_ts (for temporal RoPE)
+                # We request `return_tensors="pt"` so outputs are native PyTorch.
                 multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
+
+                # We do not need the decode text converted again to input ids, we already have them
+                # And this converted might not equal to the origin causing issue with RL later.
                 multi_modal_inputs.pop("input_ids", None)
                 multi_modal_inputs.pop("attention_mask", None)
 
@@ -506,6 +685,15 @@ class AgentLoopWorkerBase:
                 video_grid_thw = multi_modal_inputs.get("video_grid_thw")
                 second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
 
+                # Compute the *vision RoPE position indices* for Qwen2-VL.
+                # get_rope_index() returns a 3-stream tensor of shape:
+                #       (3, seq_len)
+                # representing:
+                #   stream 1: horizontal grid index
+                #   stream 2: vertical grid index
+                #   stream 3: temporal grid index (videos)
+                #
+                # These are NOT merged — Qwen2-VL expects 3 separate RoPE channels.
                 vision_position_ids = get_rope_index(
                     self.processor,
                     input_ids=input_ids.squeeze(0),
@@ -515,16 +703,49 @@ class AgentLoopWorkerBase:
                     attention_mask=attention_mask.squeeze(0),
                 ).unsqueeze(0)  # (1, 3, seq_len)
 
+                # Identify which tokens are non-padding so we can assign text positions only to real tokens.
                 valid_mask = attention_mask[0].bool()
+
+                # Build the text 1-D position IDs:
+                #   shape: (1, seq_len)
+                # Initialized with ones; then fill only valid positions with range(0, num_valid_tokens).
                 text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
                 text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
                 text_position_ids = text_position_ids.unsqueeze(0)
+
+                # Qwen2-VL multi-stream RoPE:
+                #
+                # The model expects:
+                #     position_ids: (batch, num_streams, seq_len)
+                #
+                # where:
+                #   stream 0 → text positions (1 stream)
+                #   stream 1-3 → vision RoPE components (3 streams)
+                #
+                # So we concatenate:
+                #   (1, 1, seq_len)  # text_position_ids
+                #   (1, 3, seq_len)  # vision_position_ids
+                #
+                # Resulting in:
+                #   (1, 4, seq_len)
+                # which is exactly the format the Qwen2-VL transformer expects internally.
+
+                # Qwen2-VL uses *separate* RoPE streams for text (1D) and vision (3-channel 2D/3D grids).
+                # Text and image tokens do NOT share a unified positional timeline; their relative
+                # positions are intentionally unspecified. Cross-modal alignment is learned through
+                # attention (text ↔ vision) rather than positional offsets. Concatenating text and
+                # vision RoPE streams gives the (1, 4, seq_len) format Qwen expects.
                 position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
             else:
                 position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
             enable_async_reward = (
                 self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
             ) or not self.config.reward_model.enable
+
+            # If the agent loop didn't compute a reward, send the completed prompt/response
+            # sequence to the async RewardManagerWorker. We wrap tokens + metadata into a
+            # DataProto, call the remote reward model, and store the returned reward score
+            # and extra diagnostic info into the output.
             if output.reward_score is None and enable_async_reward:
                 batch = TensorDict(
                     {
@@ -596,9 +817,21 @@ class AgentLoopWorkerBase:
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):
             prompt_length = prompt_ids.size(1)
+            # Count valid response tokens, but subtract 1 to skip the final EOS token.
+            # Reward is placed on the last meaningful generated token, not EOS.
             response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
             rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+            # rm_scores is a [batch, response_mask.size(1)] matrix containing exactly one non-zero
+            # reward per sample. We place the reward on the last *meaningful* generated token
+            # (i.e., the final non-padding, non-EOS token). For example, if a response has
+            # valid tokens [tok, tok, tok, tok, eos, pad], its valid count is 5 and the reward
+            # is written at index 4. All other positions remain zero:
+            #
+            #   [
+            #     [0, 0, 0, 0, 1.3, 0],   # reward for sample 0 at last real token
+            #     [0, 0, 0, -0.7, 0, 0],  # reward for sample 1 at last real token
+            #   ]
             batch["rm_scores"] = rm_scores
 
         non_tensor_batch = {
@@ -633,7 +866,12 @@ class AgentLoopWorkerBase:
         )
 
     def create_transferqueue_client(self, controller_infos, storage_infos, role):
-        """Create a client for data system(transfer queue)."""
+        """Create a client for data system(transfer queue).
+        Wrapper around the global transferqueue client factory. We generate a unique
+        client_id for this worker (role_worker_xxxxxx) and forward it to the shared
+        utility function. The names are the same but come from different namespaces:
+        this is a convenience wrapper, not a duplicate definition.
+        """
         from verl.single_controller.ray.base import get_random_string
         from verl.utils.transferqueue_utils import create_transferqueue_client
 
@@ -655,7 +893,7 @@ class AgentLoopWorker(AgentLoopWorkerBase):
         """Initialize agent loop manager.
         Args:
             config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            server_handles returned by AsyncLLMServerManager (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
             reward_router_address (str): reward router address.
         """
         super().__init__(config, server_handles, reward_router_address)
@@ -666,7 +904,7 @@ async def get_trajectory_info(step, index, validate):
 
     Args:
         step (int): global steps in the trainer.
-        index (list): form datastore extra_info.index column.
+        index (list): from datastore extra_info.index column.
         validate (bool): whether is a validate step.
 
     Returns:
@@ -717,6 +955,82 @@ class AgentLoopManager:
             self.sleep()
 
     def _initialize_llm_servers(self):
+        """
+        Initialize all distributed LLM rollout servers used by VERL.
+
+        This method determines how many GPUs a *single* model replica requires,
+        how many GPUs are available in the cluster, how many full replicas can be
+        launched in parallel, and then initializes those replicas as Ray actors
+        running vLLM-backed OpenAI-compatible inference servers.
+
+        - A Ray task is a stateless function executed remotely.
+        - A Ray actor is a stateful class instance living on a remote worker process.
+
+        ----------------------------------------------------------------------------
+        1. Compute GPUs needed for one model replica
+        One replica spans:
+            tensor_model_parallel_size  (TP)
+            x pipeline_model_parallel_size (PP)
+            x data_parallel_size           (DP)
+        GPUs. DP is intra-replica replication (synchronized copies *inside*
+        a single model replica), not the number of rollout replicas.
+
+        2. Determine total GPUs in the cluster
+        - If hybrid training is enabled, use Ray WorkerGroup world_size.
+        - Otherwise, compute from trainer config (n_gpus_per_node × nnodes).
+
+        3. Determine how many replicas can be launched
+            num_replicas = world_size // rollout_world_size
+        This is *inter-model* parallelism: how many independent vLLM inference
+        servers can run in parallel. It is distinct from DP.
+
+        4. Instantiate rollout replica objects
+        The replica class is obtained from get_rollout_replica_class(...).
+        This class encapsulates all logic to configure and launch distributed
+        vLLM (TPxPPxDP ranks, distributed groups, ports, cache settings).
+
+        5. Launch vLLM servers (async initialization)
+        Each rollout replica exposes async initialization methods:
+            init_standalone() or init_hybrid()
+        These are asynchronous because they internally bring up distributed
+        vLLM executors, initialize process groups, and allocate GPU resources.
+
+        Because these init functions return awaitables, VERL calls them via
+        _run_all([...]) which executes them inside a temporary asyncio event
+        loop to ensure correct async startup of all replicas.
+
+        - Think of Evagelion's wunder start up sequence.
+        - Multiple anti-gravity machines are started in a loop in a non-blocking fashion
+
+        After initialization, each replica becomes a full vLLM-based
+        OpenAI-compatible LLM server that handles:
+            - token generation
+            - KV-cache management
+            - batching + scheduling
+            - distributed execution over TPxPPxDP GPUs
+
+        6. Store server handles and addresses
+        Each replica exposes:
+            _server_handle  → Ray actor handle for RPC
+            _server_address → network endpoint for low-level communication
+        These are gathered so AsyncLLMServerManager can route generation
+        requests and manage sticky sessions.
+
+        ----------------------------------------------------------------------------
+        Interaction with AsyncLLMServerManager and RL rollouts
+        ----------------------------------------------------------------------------
+        - AsyncLLMServerManager performs async load balancing and sticky routing:
+            new request_ids → least-loaded replica
+            same request_id → same replica (for KV-cache reuse)
+        - KV-cache locality is preserved across multi-turn episodes (tool-calling,
+        ReAct, etc.).
+        - Multiple vLLM replicas run independently to maximize rollout throughput.
+
+        In summary:
+        This method builds a distributed, multi-replica vLLM inference cluster,
+        launched asynchronously through get_rollout_replica_class, and optimized
+        for high-throughput, multi-turn, asynchronous RL rollouts.
+        """
         rollout_world_size = (
             self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
             * self.config.actor_rollout_ref.rollout.data_parallel_size
@@ -727,6 +1041,10 @@ class AgentLoopManager:
             if self.worker_group
             else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         )
+        # data_parallel_size (DP) is used *inside* one model replica (3-way replicated model),
+        # while num_replicas is how many full replicas we can fit across the cluster.
+        # Thus DP does NOT equal num_replicas. DP increases GPU cost per replica,
+        # num_replicas = total_gpus // (TP * PP * DP).
         num_replicas = world_size // rollout_world_size
 
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -747,14 +1065,6 @@ class AgentLoopManager:
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
-        print(f"AgentLoopManager: {self.server_addresses}")
-
-        # Update Prometheus configuration with server addresses
-        if rollout_config.prometheus.enable:
-            if rollout_config.disable_log_stats:
-                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            update_prometheus_config(rollout_config.prometheus, self.server_addresses)
-
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
@@ -762,6 +1072,16 @@ class AgentLoopManager:
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
+            # All ray remote actors after decoration have the options class for specifying affinity
+            # NOTE:
+            # Calling `self.agent_loop_workers_class.options(...).remote(config, handles, ...)`
+            # tells Ray to:
+            #   1) Launch an AgentLoopWorker as a *remote Python process* on a selected node.
+            #   2) Automatically set up all RPC sockets/channels used for communication.
+            #   3) Initialize the actor’s dedicated asyncio event loop.
+            #   4) Allow streaming of input batches via `worker.generate_sequences.remote(...)`.
+            #   5) Schedule and run many internal async AgentLoop tasks concurrently.
+            #   6) Return an ObjectRef for the async result once the actor finishes the call.
             node_id = node_ids[i % len(node_ids)]
             self.agent_loop_workers.append(
                 self.agent_loop_workers_class.options(

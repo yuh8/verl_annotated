@@ -159,6 +159,7 @@ def tqbridge(put_data: bool = True):
 
     Returns:
         A decorator function used to decorate target functions (synchronous or asynchronous).
+        A decorator is just a callable that takes another callable and returns a callable.
     """
 
     def decorator(func):
@@ -202,9 +203,11 @@ def tqbridge(put_data: bool = True):
         async def dummy_async_inner(*args, **kwargs):
             return await func(*args, **kwargs)
 
+        # Create dummy versions (no conversion) for when TransferQueue is disabled
         wrapper_inner = inner if is_transferqueue_enabled else dummy_inner
         wrapper_async_inner = async_inner if is_transferqueue_enabled else dummy_async_inner
 
+        # Final decision: async or sync wrapper using python native iscoroutinefunction
         wrapper = wrapper_async_inner if inspect.iscoroutinefunction(func) else wrapper_inner
         return wrapper
 

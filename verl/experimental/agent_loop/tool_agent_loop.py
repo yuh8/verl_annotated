@@ -11,6 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+# ------------------------------------------------------------------------------
+# ASYNC MODEL (Illustration)
+#
+# Each AgentLoopWorker = 1 Ray actor → 1 asyncio event loop.
+#
+# For a batch:
+#     asyncio.create_task(...) spawns many AgentLoop tasks:
+#
+#         Event Loop:
+#             ├─ Task A (sample 0)
+#             ├─ Task B (sample 1)
+#             ├─ Task C (sample 2)
+#             └─ ...
+#
+# When a task hits `await`:
+#     Example:
+#         raw = await server.generate(...)   # Task A pauses here
+#
+#     While Task A waits:
+#         → Event loop runs Task B
+#         → Event loop runs Task C
+#         → Event loop handles tool calls, rewards, etc.
+#
+# Only the awaiting task pauses — the event loop never blocks.
+#
+# CPU-heavy work (e.g., tokenizer.decode) is offloaded with:
+#     run_in_executor(None, ...)
+#
+# Result: all AgentLoops run concurrently and the worker stays fully responsive.
+
+
 import asyncio
 import copy
 import json
@@ -75,9 +108,6 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
-
-        # Extra fields for dynamic addition
-        self.extra_fields: dict[str, Any] = {}
 
 
 @register("tool_agent")
@@ -302,15 +332,22 @@ class ToolAgentLoop(AgentLoopBase):
 
             # Handle image data
             if tool_response.image:
+                if agent_data.image_data is None:
+                    agent_data.image_data = []
+                elif not isinstance(agent_data.image_data, list):
+                    agent_data.image_data = [agent_data.image_data]
+
                 # Add new image data
                 if isinstance(tool_response.image, list):
                     # Ensure all elements in the list are valid image objects
                     for img in tool_response.image:
                         if img is not None:  # Add a check to ensure the image is not None
+                            agent_data.image_data.append(img)
                             new_images_this_turn.append(img)  # Using local variable
                 else:
                     # Ensure the image is not None
                     if tool_response.image is not None:
+                        agent_data.image_data.append(tool_response.image)
                         new_images_this_turn.append(tool_response.image)  # Using local variable
 
             # Handle video data
@@ -363,15 +400,6 @@ class ToolAgentLoop(AgentLoopBase):
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
-
-        if new_images_this_turn:
-            if agent_data.image_data is None:
-                agent_data.image_data = []
-            elif not isinstance(agent_data.image_data, list):
-                agent_data.image_data = [agent_data.image_data]
-            for img in new_images_this_turn:
-                agent_data.image_data.append(img)
-
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:

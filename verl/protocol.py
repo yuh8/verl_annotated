@@ -334,6 +334,24 @@ class DataProto:
     same batch size should be put inside batch.
     """
 
+    # NOTE:
+    # We use TensorDict instead of a plain Python dict for holding batched RL data.
+    # TensorDict is a structured container for PyTorch tensors that enforces consistent
+    # batch dimensions and supports torch-level operations (stacking, slicing, device moves).
+    #
+    # Advantages over a regular Python dict:
+    #   • Shape safety: all tensors share the same leading batch size, preventing silent
+    #     misalignment between fields (e.g., obs[32] vs. reward[16]).
+    #   • Torch operations: supports .to(device), .cpu(), .stack(), .cat(), etc. directly,
+    #     allowing vectorized GPU operations and easy batching of rollouts.
+    #   • Nested structure: can represent hierarchical data (e.g., multi-agent obs/action)
+    #     without losing tensor semantics.
+    #   • Integration: works seamlessly with TorchRL replay buffers, collectors, and
+    #     distributed data pipelines.
+    #
+    # In short, TensorDict provides a safe, efficient, and GPU-compatible way to manage
+    # structured batched tensors—unlike Python dicts, which lack batch consistency checks
+    # and tensor-aware operations.
     batch: TensorDict = None
     non_tensor_batch: dict = field(default_factory=dict)
     meta_info: dict = field(default_factory=dict)
@@ -549,6 +567,9 @@ class DataProto:
             meta_info[DataProtoConfig.auto_padding_key] = True
         return cls(batch=tensor_dict, non_tensor_batch=non_tensors, meta_info=meta_info)
 
+    # @classmethod lets you define methods that construct or manipulate the class itself, not a particular instance.
+    # It’s ideal for “factory” constructors like DataProto.from_tensordict() that return an instance built from another data format.
+    # Basically, we instantiate class from a different input format. classmethod converts this format into class compatible format
     @classmethod
     def from_tensordict(
         cls,
