@@ -18,6 +18,22 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+"""
+HYBRID ENGINE: Single worker process hosts BOTH training (FSDP/Megatron) AND inference (vLLM) engines on same GPUs
+
+WHY: Saves 50% GPU cost by time-multiplexing instead of separate training/inference GPU pools
+HOW: wake/sleep swaps active engine by offloading inactive one's memory to CPU
+
+FLOW (ray_trainer.py → agent_loop.py → vllm_async_server.py:389/396):
+  1. update_actor() → FSDP engine trains (optimizer ~40GB + gradients ~20GB active)
+  2. wake_up() → Swap: offload FSDP resources to CPU, allocate vLLM KV cache ~30GB, sync W_fsdp → W_vllm
+  3. generate() → vLLM engine generates (returns rollout_log_probs from W_vllm, bf16)
+  4. sleep() → Swap: free vLLM KV cache, restore FSDP optimizer/gradients from CPU
+  5. IS ratio = exp(old_log_probs - rollout_log_probs) corrects for engine differences
+
+Single worker = both engines, context switch = memory swap, weight sync = in-GPU copy (fast, no network)
+"""
+
 import json
 import os
 import uuid
@@ -79,6 +95,23 @@ class ResourcePoolManager:
         with each pool managing GPU resources across multiple nodes.
         For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
         For Megatron backend, uses max_colocate_count>1 for different models.
+
+        # FSDP: max_colocate_count=1
+        # - ONE WorkerGroup per resource pool (not per node)
+        # - This WorkerGroup spans MULTIPLE nodes
+        # - The model is sharded across all GPUs in this single WorkerGroup
+        # - All workers collaborate on the SAME model instance
+
+        # Example: 4 nodes, 8 GPUs each = 32 total GPUs
+        # - One WorkerGroup with 32 workers across all 4 nodes
+        # - Model parameters divided into 32 shards, one per GPU
+
+
+        # Megatron: max_colocate_count>1
+        # - MULTIPLE WorkerGroups can share the same resource pool
+        # - Each group might train a different model variant
+        # - Or different pipeline stages of the same model
+        # - Useful for multi-task or multi-model training
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
@@ -679,7 +712,7 @@ class RayPPOTrainer:
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # create actor and rollout in hybrid engine. Both actor and rollout share the same workergroup and resouce pool
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(
@@ -691,14 +724,14 @@ class RayPPOTrainer:
         else:
             raise NotImplementedError
 
-        # create critic
+        # create critic in a workergroup in a different resource pool
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
-        # create reference policy if needed
+        # create reference policy if needed in a workergroup in a different resource pool
         if self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
@@ -708,17 +741,17 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
-        # create a reward model if reward_fn is None
+        # create a reward model if reward_fn is None in a workergroup in a different resource pool
         if self.use_rm:
             # we create a RM here
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
 
-        # initialize WorkerGroup
+        # initialize WorkerGroup for actor-rollout in hybrid model, and critic and reward workergroup, each in different resource pool
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
+        # ***Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
@@ -1097,8 +1130,12 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            # In sync hybrid mode, ray_trainer.py does not use RolloutReplica at all; it uses ActorRolloutRefWorker and in-process rollout instead of the replica server abstraction.
+
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
+                            # In async mode, generate_sequences goes through the AgentLoopManager machinery that relies on the RolloutReplica hybrid linkage
+
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])

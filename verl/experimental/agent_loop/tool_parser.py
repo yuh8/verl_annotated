@@ -11,6 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# ------------------------------------------------------------------------------
+# Tool Parser Module Overview
+#
+# Extracts tool calls from raw LLM output.
+#   • ToolParser: base class + registry.
+#   • HermesToolParser / GptOssToolParser: regex-based extractors.
+#   • FunctionCall: structured {name, arguments}.
+#
+# Workflow:
+#   1) Decode response token IDs (offloaded via run_in_executor).
+#   2) Strip tool-call markup from text.
+#   3) Return (clean_text, parsed_tool_calls).
+#
+# Purpose: Convert model-generated tool-call markup into structured function
+# calls the agent loop can execute.
+# ------------------------------------------------------------------------------
+
+
 import asyncio
 import json
 import logging
@@ -26,6 +45,22 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# ------------------------------------------------------------------------------
+# NOTE: When to use Pydantic BaseModel vs dataclass
+#
+# • Use Pydantic BaseModel when the data crosses async or distributed boundaries
+#   (Ray actors, tool calls, reward model RPCs). BaseModel validates types,
+#   auto-converts fields, and guarantees the structure is safe to serialize.
+#   This is why VERL uses BaseModel for AgentLoopOutput, metrics, and tool results.
+#
+# • Use a dataclass (or simple class) for internal, lightweight state that does
+#   not require validation and is mutated frequently (e.g., AgentData). Dataclasses
+#   are faster to construct and have no validation overhead.
+#
+# In short:
+#   Pydantic → validated, safe, serializable data shared across components.
+#   dataclass → simple, fast containers for internal, trusted state.
+# ------------------------------------------------------------------------------
 class FunctionCall(BaseModel):
     arguments: str
     """

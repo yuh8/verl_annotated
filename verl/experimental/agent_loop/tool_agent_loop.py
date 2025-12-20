@@ -76,7 +76,31 @@ class AgentState(Enum):
 
 
 class AgentData:
-    """Encapsulates all state variables for the agent loop."""
+    """Encapsulates all state variables for the agent loop.
+    ------------------------------------------------------------------------------
+    ABOUT AgentData AND non_tensor_batch (DataProto)
+
+    AgentData objects are reconstructed from the `non_tensor_batch` field of
+    DataProto. VERL stores all *non-tensor* per-sample information here because it
+    cannot be represented as PyTorch tensors. This includes:
+
+    • conversation messages (strings)
+    • tool call specifications (dicts, lists of objects)
+    • image data or other modalities
+    • tool kwargs / metadata
+    • arbitrary Python objects needed for agent-loop state
+
+    These fields live in `non_tensor_batch` as numpy arrays of Python objects
+    aligned with the batch dimension. When an AgentLoop starts, the worker extracts
+    one row of these fields and wraps them into an AgentData instance so the loop
+    can mutate and track the evolving state of that sample.
+
+    In short:
+    DataProto.non_tensor_batch → (per-sample Python fields) → AgentData
+
+    This design isolates all non-tensor conversational state inside AgentData,
+    while tensor data (input_ids, masks, positions, etc.) stays in DataProto.batch.
+    """
 
     def __init__(
         self,
@@ -170,6 +194,7 @@ class ToolAgentLoop(AgentLoopBase):
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(request_id, **interaction_kwargs)
         # Create AgentData instance to encapsulate all state
+        # agent_data is stateful
         agent_data = AgentData(
             messages=messages,
             image_data=image_data,
@@ -180,11 +205,13 @@ class ToolAgentLoop(AgentLoopBase):
             interaction_kwargs=interaction_kwargs,
         )
 
-        # State machine loop
+        # State machine loop equivalent to lang graph of stateful node
         state = AgentState.PENDING
         while state != AgentState.TERMINATED:
+            # tokenize message and image using self.processor
             if state == AgentState.PENDING:
                 state = await self._handle_pending_state(agent_data, sampling_params)
+            #
             elif state == AgentState.GENERATING:
                 state = await self._handle_generating_state(agent_data, sampling_params)
             elif state == AgentState.PROCESSING_TOOLS:
@@ -217,6 +244,10 @@ class ToolAgentLoop(AgentLoopBase):
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         if self.processor is not None:
+            # self.loop comes from the base class self.loop = asyncio.get_running_loop()
+            # Offload blocking CPU work to a background thread so it does NOT freeze
+            # the AgentLoopWorker’s asyncio event loop. `await` pauses only this task,
+            # while other AgentLoop tasks continue running concurrently.
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -227,6 +258,14 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
+            # NOTE:
+            # `self.processor(...)` *can* be wrapped in `run_in_executor(None, ...)`, but it is
+            # usually unnecessary. The processor executes most heavy work in C++/CUDA and
+            # releases the GIL, so calling it directly does NOT block the AgentLoopWorker’s
+            # asyncio event loop. Offloading it to a thread pool adds overhead without benefit.
+            #
+            # Only wrap the processor in `run_in_executor` if you add custom Python-heavy
+            # preprocessing that would otherwise block the event loop.
             model_inputs = self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt")
             agent_data.prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
@@ -291,7 +330,21 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
-        """Handle the processing tools state: execute tool calls and prepare tool responses."""
+        """Handle the processing tools state: execute tool calls and prepare tool responses.
+        Mental model
+        AgentLoopWorker (Ray actor process)
+        └── ONE asyncio event loop
+                ├── AgentLoop Task A
+                │       ├── _handle_processing_tools_state()
+                │       │       ├── Task A1 = _call_tool()
+                │       │       ├── Task A2 = _call_tool()
+                │       │       ├── Task A3 = _call_tool()
+                │       │       └── await gather(A1, A2, A3)
+                │       └── ...
+                ├── AgentLoop Task B
+                ├── AgentLoop Task C
+                └── ...
+        """
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
 

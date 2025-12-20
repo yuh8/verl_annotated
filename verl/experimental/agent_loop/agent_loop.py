@@ -53,7 +53,12 @@ import numpy as np
 import ray
 import torch
 from cachetools import LRUCache
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import (
+    # DictConfig  → the object you work with
+    DictConfig,
+    # the toolbox that creates/manipulates it
+    OmegaConf,
+)
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
@@ -372,7 +377,7 @@ class AgentLoopWorkerBase:
         self,
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
-        reward_router_address: str = None,
+        reward_router_address: str = None,  # type: ignore
     ):
         """Initialize agent loop manager.
 
@@ -451,7 +456,7 @@ class AgentLoopWorkerBase:
         #    ├── runs independently on same node
         #    ├── has access to same GPU / local router
         #    └── receives (config, reward_router_address)
-        self.reward_manager_worker = RewardManagerWorker.options(
+        self.reward_manager_worker = RewardManagerWorker.options(  # type: ignore
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False,
@@ -508,6 +513,7 @@ class AgentLoopWorkerBase:
             sampling_params["temperature"] = config.val_kwargs.temperature
 
         # by default, we assume it's a single turn agent
+        # agent name should be added in the parquet when preparing data
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
@@ -532,7 +538,7 @@ class AgentLoopWorkerBase:
         # a list of dictionaries, each containing:
         #     • step:        current global training step
         #     • sample_index: trajectory/episode ID for this sample
-        #     • rollout_n:    how deep we are in this trajectory segment
+        #     • rollout_n:    how deep we are in this trajectory segment or the number of turns
         #     • validate:     whether this batch is from a validation rollout
 
         # Returns:
@@ -543,6 +549,7 @@ class AgentLoopWorkerBase:
 
         # event loop for creating non blocking tasks (rollouts of samples)
         tasks = []
+        # non-tensor batch contains all text data (prompts) for rollout
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
@@ -1058,6 +1065,11 @@ class AgentLoopManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        # - When a RayWorkerGroup is provided which is the ActorRolloutWorkerGroup, it initializes rollout replicas (e.g., vLLM/SGLang) in hybrid mode by binding them to that worker group:
+        # - self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
+
+        # - This directly calls RolloutReplica.init_hybrid(worker_group), linking the trainer’s Actor+Rollout RayWorkerGroup to the rollout servers. This is the essence of hybrid engine
+
         if self.worker_group:
             self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
         else:
@@ -1084,7 +1096,7 @@ class AgentLoopManager:
             #   6) Return an ObjectRef for the async result once the actor finishes the call.
             node_id = node_ids[i % len(node_ids)]
             self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
+                self.agent_loop_workers_class.options(  # type: ignore
                     name=f"agent_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
@@ -1149,13 +1161,50 @@ class AgentLoopManager:
 
         return timing
 
+    """
+    ASYNC ROLLOUT MODE: Wake/Sleep Call Chain & Memory Offloading
+    ==============================================================
+
+    CALL CHAIN (Generation Flow):
+    agent_loop.py:AgentLoopManager.generate_sequences()
+        └─> if free_cache_engine: self.wake_up()
+            └─> vllm_async_server.py:vLLMReplica.wake_up()
+                └─> vLLMHttpServer.wake_up() [HYBRID mode]
+                    └─> worker.wake_up.remote() for each worker
+                        └─> fsdp_workers.py:AsyncActorRolloutRefWorker.wake_up()
+                            └─> self.rollout_mode()  ← ACTUAL OFFLOAD HAPPENS HERE
+
+    CPU OFFLOAD & KV ALLOCATION (in rollout_mode()):
+    1. aggressive_empty_cache() - Free CUDA cache outside vLLM
+    2. load_fsdp_model_to_gpu() - Materialize weights temporarily (if offloaded)
+    3. Collect weights from FSDP actor (LoRA or full)
+    4. offload_fsdp_model_to_cpu() - Offload params back to CPU (if configured)
+    5. set_expandable_segments(False) - Switch to vLLM allocator mode
+    6. rollout.resume(tags=["weights"]) - Prep vLLM to receive weights
+    7. rollout.update_weights() - Sync W_fsdp → W_vllm (in-GPU copy)
+    8. rollout.resume(tags=["kv_cache"]) - Allocate vLLM KV cache (~30GB)
+    Result: FSDP state on CPU, vLLM weights+KV on GPU
+
+    SLEEP REVERSAL (After Generation):
+    AgentLoopManager.sleep() → vLLMHttpServer.sleep() → worker.sleep.remote()
+        └─> AsyncActorRolloutRefWorker.trainer_mode()
+            1. rollout.release() - Free vLLM KV cache and buffers
+            2. actor_module_fsdp.train() - Switch to training mode
+            3. set_expandable_segments(True) - Restore training allocator
+
+    CONFIG FLAGS:
+    - free_cache_engine: True → Enable wake/sleep (required for offload)
+    - param_offload: Controls FSDP param CPU offload
+    - optimizer_offload: Controls optimizer state CPU offload
+    """
+
     def wake_up(self):
         """Wake up all rollout replica instances."""
-        self._run_all([replica.wake_up() for replica in self.rollout_replicas])
+        self._run_all([replica.wake_up() for replica in self.rollout_replicas])  # type: ignore
 
     def sleep(self):
         """Sleep all rollout replica instances."""
-        self._run_all([replica.sleep() for replica in self.rollout_replicas])
+        self._run_all([replica.sleep() for replica in self.rollout_replicas])  # type: ignore
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

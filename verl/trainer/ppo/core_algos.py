@@ -273,6 +273,8 @@ def compute_grpo_outcome_advantage(
     """
     Compute advantage for GRPO, operating only on Outcome reward
     (with only one scalar reward for each response).
+    # [0, 0, 0, 0, 1.3, 0],   # reward for sample 0 at last real token
+    # [0, 0, 0, -0.7, 0, 0],  # reward for sample 1 at last real token
 
     Args:
         token_level_rewards: `(torch.Tensor)`
@@ -280,7 +282,7 @@ def compute_grpo_outcome_advantage(
         response_mask: `(torch.Tensor)`
             shape is (bs, response_length)
         index: `(np.ndarray)`
-            index array for grouping
+            index array (uuid) for grouping
         epsilon: `(float)`
             small value to avoid division by zero
         norm_adv_by_std_in_grpo: `(bool)`
@@ -962,7 +964,7 @@ def compute_policy_loss_vanilla(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    # Apply rollout importance sampling weights if provided
+    # Apply rollout importance sampling weights if provided. This is important for bias correction between vLLM rollout and the actor model recomputed. Samples actually come from vLLM not the actor model, that is why we need this!
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
