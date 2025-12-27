@@ -367,7 +367,7 @@ class DataParallelPPOActor(BasePPOActor):
             "response_mask",
             "input_ids",
             "attention_mask",
-            "position_ids",
+            "position_ids",  # For ROPE, if QwenVL, position_ids is (1, 4, seq_len) with one channel for text and 3 channels for vision  # noqa: E501
             "old_log_probs",
             "advantages",
         ]

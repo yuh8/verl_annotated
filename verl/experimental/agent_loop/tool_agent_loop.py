@@ -43,6 +43,68 @@
 #
 # Result: all AgentLoops run concurrently and the worker stays fully responsive.
 
+# Understanding of the contract between external services with URL as tools and the tool_agent_loop
+
+# 1. Model-facing contract (input arguments)
+
+# - Defined by the tool schema which comes from tool_config.yaml file:
+
+#   - Each tool exposes tool.tool_schema (OpenAI-style function spec).
+#   - This schema is injected into the prompt (tools=self.tool_schemas) so the model emits JSON arguments that match it.
+
+# - At runtime:
+
+#   - The parser yields FunctionCall(name, arguments) where arguments is a JSON string.
+#   - ToolAgentLoop._call_tool does json.loads on the JSON string and then calls your tool.execute(..., tool_args).
+
+# - Implication:
+#   - Your tool adapter (execute) should accept a dict matching the schema your tool advertised. This is the only place the schema “constrains” you.
+
+# 2. Service-facing contract (your URL)
+
+# - Flexible by design:
+
+#   - Your adapter can call any URL/HTTP/SDK and parse any response shape.
+#   - There is no hard requirement that the URL return OpenAI-format or any specific structure.
+
+# - Responsibility of the adapter:
+
+#   - Normalize whatever the service returns into a ToolResponse:
+
+#     - text: str | None
+#     - image: list[Any] | None
+#     - video: list[Any] | None
+
+#   - Pydantic validators enforce that image and video must be lists (wrap singletons in a list).
+
+# 3. Agent loop-facing contract (output back to the model)
+
+# - Your adapter returns (ToolResponse, tool_reward, res) to the loop.
+
+# - The loop:
+
+#   - Truncates ToolResponse.text if it’s too long.
+
+#   - Injects ToolResponse into the conversation:
+
+#     - With processor: role="tool" messages are re-tokenized for the next turn.
+#     - With gpt-oss: role="tool" is serialized via Harmony markup internally (handled by the agent), not by your URL.
+
+#   - Marks these injected tokens with response_mask = 0 (non-LLM tokens).
+
+# Practical guidance for a “tool as a service” URL
+
+# - Allowed response: anything. JSON/XML/text/binary, as long as your adapter decodes it and maps to ToolResponse.
+
+# - Recommended:
+
+#   - If you want the model to see text: extract a concise string into ToolResponse.text (the agent will truncate if too long).
+#   - If you want the model to see images: produce a list of image objects compatible with your processor (e.g., PIL.Image, NumPy arrays) → ToolResponse.image = [img1, img2, ...].
+#   - If you don’t use a VLM processor, don’t return image/video (the agent will raise if multimedia is returned without a vision-capable processor).
+
+# - Not required:
+#   - The URL does NOT need to emit OpenAI “tool call” JSON or Harmony tags; those are model/agent-internal and handled by the agent loop + tokenizer.
+
 
 import asyncio
 import copy
@@ -295,6 +357,7 @@ class ToolAgentLoop(AgentLoopBase):
                 image_data=agent_data.image_data,
             )
 
+        # We keep concatenating to response id after each turn of multi-turn conversation
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
         agent_data.prompt_ids += agent_data.response_ids
