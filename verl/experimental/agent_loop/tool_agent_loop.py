@@ -413,6 +413,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         tool_call_names = []
+        # we are limiting the number of tool calls per turn, to safeguard against tool abuse per turn
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs))
             tool_call_names.append(tool_call.name)

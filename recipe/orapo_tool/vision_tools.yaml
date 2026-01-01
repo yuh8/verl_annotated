@@ -1,0 +1,76 @@
+# Register tools for ToolAgentLoop via initialize_tools_from_config()
+# This file is loaded from: config.actor_rollout_ref.rollout.multi_turn.tool_config_path
+#
+# Replace the service URLs and headers with your actual endpoints/keys.
+
+tools:
+  - class_name: verl.tools.image_classification_tool.ImageClassificationTool
+    # Native tools are constructed directly with the provided config and tool_schema
+    config:
+      type: native
+      # Concurrency / rate limiting
+      num_workers: 20
+      rate_limit: 50
+      enable_global_rate_limit: true
+      timeout: 30
+      # Service configuration
+      classification_service_url: "https://YOUR-CLASSIFICATION-ENDPOINT/api/classify"  # <-- SET ME
+      payload_format: "multipart"   # or "json_base64"
+      image_field_name: "image"
+      request_headers: {}           # e.g., {"Authorization": "Bearer YOUR_TOKEN"}
+      request_extra_fields: {}      # default fields sent with every request
+      json_base64_data_uri: false   # true to send data URIs when using json_base64
+      # Response handling
+      response_text_key: "predictions"     # optional: extract specific JSON field
+      response_strict_json: false          # true to require JSON response
+    tool_schema:
+      type: function
+      function:
+        name: classify_image
+        description: Classify the current image using a remote classification service.
+        parameters:
+          type: object
+          properties:
+            topk:
+              type: integer
+              description: Number of top classes to return (optional).
+            extra:
+              type: object
+              description: Extra fields to merge into the request (optional).
+          required: []
+
+  - class_name: verl.tools.image_segmentation_tool.ImageSegmentationTool
+    config:
+      type: native
+      # Concurrency / rate limiting
+      num_workers: 20
+      rate_limit: 50
+      enable_global_rate_limit: true
+      timeout: 30
+      # Service configuration
+      segmentation_service_url: "https://YOUR-SEGMENTATION-ENDPOINT/api/segment"  # <-- SET ME
+      payload_format: "json_base64"   # or "multipart"
+      image_field_name: "image"
+      request_headers: {}           # e.g., {"Authorization": "Bearer YOUR_TOKEN"}
+      request_extra_fields: {}      # default fields sent with every request
+      json_base64_data_uri: false
+      # Output post-processing (used if server returns mask)
+      response_content_is_overlay: false   # true if server returns the final overlay image
+      overlay_color: [255, 0, 0]           # RGB
+      overlay_alpha: 0.5                   # 0..1
+      return_image: "overlay"              # "overlay" or "mask"
+    tool_schema:
+      type: function
+      function:
+        name: segment_image
+        description: Segment the current image using a remote service and return a masked/overlay image.
+        parameters:
+          type: object
+          properties:
+            threshold:
+              type: number
+              description: Threshold in [0,1] to binarize soft masks (optional).
+            extra:
+              type: object
+              description: Extra fields to merge into the request (optional).
+          required: []
