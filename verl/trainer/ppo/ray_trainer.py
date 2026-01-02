@@ -1284,6 +1284,14 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # TL;DR: update_actor → update_policy linkage (who calls what)
+                            # RayPPOTrainer.fit() calls: self.actor_rollout_wg.update_actor(batch)
+                            # ActorRolloutRefWorker (verl/workers/fsdp_workers.py) implements update_actor(...):
+
+                            # - Decorated with @register(...) so RayWorkerGroup can dispatch the call to all actor ranks. This decorator also takes care of sharding of data batch for each GPU.
+
+                            # - Calls self.actor.update_policy(data) under Ulysses sharding/context.
+                            # self.actor is a DataParallelPPOActor (verl/workers/actor/dp_actor.py), created in ActorRolloutRefWorker.init_model(). DataParallelPPOActor implements update_policy(...), which: - Runs micro-batch forwards via _forward_micro_batch(...) - Builds PPO/GRPO loss via core_algos.get_policy_loss_fn / agg_loss / kl_penalty - Applies IS weights if present - Backprops and steps optimizer via _optimizer_step()
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

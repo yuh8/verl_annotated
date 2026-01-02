@@ -400,6 +400,7 @@ class DataParallelPPOActor(BasePPOActor):
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
+                    # self.config.ppo_micro_batch_size_per_gpu is the actual batch size each gpu running this dp_actor.py sees
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
@@ -491,6 +492,10 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    # compute and aggregate gradients only. In PyTorch, gradients accumulate by default
+                    # into each parameter’s .grad buffer until you call optimizer.zero_grad() (or module.zero_grad()).
+                    # So repeated calls to loss.backward() across micro-batches will add (in-place) to .grad,
+                    # effectively doing grad_accum += grad_micro.
                     loss.backward()
 
                     micro_batch_metrics.update(
@@ -503,6 +508,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                # update parameter
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
