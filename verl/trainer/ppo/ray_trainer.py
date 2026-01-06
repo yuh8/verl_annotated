@@ -18,6 +18,40 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+""" RayPPOTrainer — driver-centric PPO with Ray and FSDP
+
+High-level:
+
+- The Ray driver (this process) owns the full dataset and constructs full DataProto batches per step.
+- It orchestrates rollout on workers (hybrid engine: FSDP training + vLLM inference via wake/sleep), computes rewards/KL/IS on the driver, and computes advantages centrally on the driver.
+
+Distributed dispatch:
+
+- Data is only sharded when invoking remote RPCs such as:
+
+  - actor_rollout_wg.compute_log_prob(...), actor_rollout_wg.update_actor(...)
+  - critic_wg.compute_values(...), critic_wg.update_critic(...)
+
+- The register(..., dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name)) 
+  wrapper shards DataProto across data-parallel (DP) ranks for the named mesh and collects outputs.
+
+FSDP synchronization (model sharding and updates):
+
+- Models are wrapped by FSDP/FSDP2; parameters are sharded across ranks.
+- Forward/backward use lazy all-gather of needed shards and re-shard afterward.
+- Gradients are reduce-scattered across the DP group; each rank’s optimizer.step() updates its shard. 
+  The union of shards forms the new, globally consistent model (no extra broadcast needed).
+- Ulysses sequence-parallel (if enabled) slices compute for efficiency; DP gradient sync still comes from FSDP.
+
+Driver workflow per step:
+
+1. Build full batch; optionally balance by sequence length.
+2. Generate rollouts remotely; union outputs back on the driver.
+3. Compute token-level rewards (and optional KL-in-reward, IS) on the driver.
+4. Compute advantages on the driver.
+5. Call update_critic / update_actor: dispatcher shards the batch; FSDP handles grad sync and parameter updates.
+"""
+
 """
 HYBRID ENGINE: Single worker process hosts BOTH training (FSDP/Megatron) AND inference (vLLM) engines on same GPUs
 
@@ -1112,7 +1146,9 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # add uid to batch
+                # add uid to batch, this is a unique id per sample
+                # later when samples are repeated rollout.n times in interleaved fashion
+                # the uid also gets repeated for advantage calcuation
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
@@ -1131,11 +1167,9 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             # In sync hybrid mode, ray_trainer.py does not use RolloutReplica at all; it uses ActorRolloutRefWorker and in-process rollout instead of the replica server abstraction.
-
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             # In async mode, generate_sequences goes through the AgentLoopManager machinery that relies on the RolloutReplica hybrid linkage
-
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])

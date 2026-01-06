@@ -860,6 +860,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
+    # Returns a mesh-aware dispatcher for DataProto:
+    # - Dispatch: lazily query DP mapping for `mesh_name`, shard DataProto across DP ranks, route per-rank shard.
+    # - Collect: lazily query collect mask, gather outputs from collector ranks, concat DataProto.
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):

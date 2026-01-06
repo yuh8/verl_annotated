@@ -357,6 +357,14 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        """
+        Backward: During loss.backward(), FSDP intercepts autograd and:
+            - All-gathers param shards on-demand for the current module’s forward,
+              then re-shards after use (forward_prefetch/reshard settings).
+            - Reduces gradients across the DP group via reduce-scatter,
+              so each rank’s .grad holds the globally aggregated gradient for its own shard (already averaged/summed as configured).
+        """
+
         # make sure we are in training mode
         self.actor_module.train()
 
